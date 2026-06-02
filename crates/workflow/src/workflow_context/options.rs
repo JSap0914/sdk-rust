@@ -24,7 +24,7 @@ use temporalio_common_wasm::{
                 ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
                 WorkflowIdReusePolicy,
             },
-            sdk::v1::UserMetadata,
+            sdk::v1::{EventGroupMarker, UserMetadata},
         },
     },
     search_attributes::SearchAttributes,
@@ -71,6 +71,10 @@ pub struct ActivityOptions {
     /// If true, disable eager execution for this activity
     #[builder(default)]
     pub do_not_eagerly_execute: bool,
+    /// Event group markers attached to the resulting `ScheduleActivityTask` command.
+    /// See [`EventGroupMarker`].
+    #[builder(default)]
+    pub groups: Vec<EventGroupMarker>,
 }
 
 impl ActivityOptions {
@@ -170,6 +174,7 @@ impl ActivityOptions {
             }),
             self.summary,
             None,
+            self.groups,
         )
     }
 }
@@ -251,6 +256,7 @@ impl LocalActivityOptions {
             }),
             self.summary,
             None,
+            vec![],
         )
     }
 }
@@ -286,6 +292,9 @@ pub struct ChildWorkflowOptions {
     pub search_attributes: Option<SearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
+    /// Event group markers attached to the resulting `StartChildWorkflowExecution` command.
+    /// See [`EventGroupMarker`].
+    pub groups: Vec<EventGroupMarker>,
 }
 
 impl ChildWorkflowOptions {
@@ -325,6 +334,7 @@ impl ChildWorkflowOptions {
             }),
             self.static_summary,
             self.static_details,
+            self.groups,
         )
     }
 }
@@ -356,6 +366,7 @@ impl Signal {
             input: self.data.input,
             identity: String::new(),
             headers: self.data.headers,
+            originating_event_id: 0,
         }
     }
 }
@@ -396,6 +407,9 @@ pub struct TimerOptions {
     pub duration: Duration,
     /// Summary of the timer
     pub summary: Option<String>,
+    /// Event group markers attached to the resulting `StartTimer` command.
+    /// See [`EventGroupMarker`].
+    pub groups: Vec<EventGroupMarker>,
 }
 
 impl From<Duration> for TimerOptions {
@@ -420,6 +434,7 @@ impl TimerOptions {
             }),
             self.summary,
             None,
+            self.groups,
         )
     }
 }
@@ -613,10 +628,12 @@ fn command_with_metadata(
     variant: workflow_command::Variant,
     summary: Option<String>,
     details: Option<String>,
+    markers: Vec<EventGroupMarker>,
 ) -> WorkflowCommand {
     WorkflowCommand {
         variant: Some(variant),
         user_metadata: string_user_metadata(summary, details),
+        event_group_markers: markers,
     }
 }
 
