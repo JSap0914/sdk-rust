@@ -11,6 +11,7 @@ use crate::runtime::{
     SdkGuardedFuture, SdkWakeGuard,
     entry::WorkflowImplementation,
     host::WorkflowHost,
+    is_sdk_wake,
     model::{
         CancelExternalWfResult, CancellableID, NexusStartResult, SignalExternalWfResult,
         TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
@@ -29,8 +30,11 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
-    task::{Poll, Waker},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Poll, Wake, Waker},
     time::{Duration, SystemTime},
 };
 use temporalio_common_wasm::{
@@ -82,10 +86,50 @@ use temporalio_common_wasm::{
 pub struct BaseWorkflowContext {
     inner: Rc<WorkflowContextInner>,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum WorkflowPollPhase {
+    Construction,
+    #[default]
+    Routine,
+}
+
+pub(crate) struct ConstructionPollGuard<'a> {
+    phase: &'a Cell<WorkflowPollPhase>,
+    previous: WorkflowPollPhase,
+}
+
+impl Drop for ConstructionPollGuard<'_> {
+    fn drop(&mut self) {
+        self.phase.set(self.previous);
+    }
+}
+
+struct ConstructionWake {
+    non_sdk_wake: Arc<AtomicBool>,
+}
+
+impl Wake for ConstructionWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if !is_sdk_wake() {
+            self.non_sdk_wake.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl BaseWorkflowContext {
-    pub(crate) fn apply_activation_context(&self, activation: &CoreWorkflowActivation) {
+    pub(crate) fn apply_activation_context(
+        &self,
+        activation: &CoreWorkflowActivation,
+        is_replaying_history_events: bool,
+    ) {
         let mut shared = self.inner.shared.borrow_mut();
         shared.activation = activation.clone();
+        shared.is_replaying_history_events = is_replaying_history_events;
         if let Some(seed) = activation.jobs.iter().find_map(|job| match &job.variant {
             Some(ActivationVariant::UpdateRandomSeed(attrs)) => Some(attrs.randomness_seed),
             _ => None,
@@ -97,6 +141,91 @@ impl BaseWorkflowContext {
     /// Returns the [`DataConverter`] associated with this workflow's worker.
     pub fn data_converter(&self) -> &DataConverter {
         &self.inner.data_converter
+    }
+
+    /// Return the workflow's unique identifier.
+    pub fn workflow_id(&self) -> &str {
+        &self.inner.inital_information.workflow_id
+    }
+
+    /// Return the run id of this workflow execution.
+    pub fn run_id(&self) -> &str {
+        &self.inner.run_id
+    }
+
+    /// Return the namespace the workflow is executing in.
+    pub fn namespace(&self) -> &str {
+        &self.inner.namespace
+    }
+
+    /// Return the task queue the workflow is executing in.
+    pub fn task_queue(&self) -> &str {
+        &self.inner.task_queue
+    }
+
+    /// Return the workflow type name.
+    pub fn workflow_type(&self) -> &str {
+        &self.inner.inital_information.workflow_type
+    }
+
+    pub(crate) fn initial_headers(&self) -> HashMap<String, Payload> {
+        self.inner.inital_information.headers.clone()
+    }
+
+    /// Return the current time according to the workflow.
+    pub fn workflow_time(&self) -> Option<SystemTime> {
+        self.inner
+            .shared
+            .borrow()
+            .activation
+            .timestamp
+            .try_into_or_none()
+    }
+
+    /// Return the length of history so far at this point in the workflow.
+    pub fn history_length(&self) -> u32 {
+        self.inner.shared.borrow().activation.history_length
+    }
+
+    /// Return current values for workflow search attributes.
+    pub fn search_attributes(&self) -> SearchAttributes {
+        SearchAttributes::from_proto(&self.inner.shared.borrow().search_attributes)
+    }
+
+    /// Returns true if the current workflow task is happening under replay.
+    pub fn is_replaying(&self) -> bool {
+        self.inner.shared.borrow().activation.is_replaying
+    }
+
+    /// Returns true if the current work is replaying history events.
+    pub fn is_replaying_history_events(&self) -> bool {
+        self.inner.shared.borrow().is_replaying_history_events
+    }
+
+    /// Returns the payload converter used by the worker running this workflow.
+    pub fn payload_converter(&self) -> &PayloadConverter {
+        self.inner.data_converter.payload_converter()
+    }
+
+    pub(crate) fn enter_construction_poll(&self) -> ConstructionPollGuard<'_> {
+        let previous = self
+            .inner
+            .poll_phase
+            .replace(WorkflowPollPhase::Construction);
+        ConstructionPollGuard {
+            phase: &self.inner.poll_phase,
+            previous,
+        }
+    }
+
+    pub(crate) fn is_construction_poll(&self) -> bool {
+        self.inner.poll_phase.get() == WorkflowPollPhase::Construction
+    }
+
+    pub(crate) fn construction_waker(&self) -> Waker {
+        Waker::from(Arc::new(ConstructionWake {
+            non_sdk_wake: self.inner.construction_non_sdk_wake.clone(),
+        }))
     }
 
     pub(crate) fn record_patch(&self, patch_id: String, present: bool) {
@@ -220,6 +349,8 @@ struct WorkflowContextInner {
     seq_nums: RefCell<WfCtxProtectedDat>,
     data_converter: DataConverter,
     state_mutated: Cell<bool>,
+    poll_phase: Cell<WorkflowPollPhase>,
+    construction_non_sdk_wake: Arc<AtomicBool>,
 }
 
 /// Context provided to synchronous signal and update handlers.
@@ -441,6 +572,8 @@ impl BaseWorkflowContext {
                 }),
                 data_converter,
                 state_mutated: Cell::new(false),
+                poll_phase: Cell::new(WorkflowPollPhase::Routine),
+                construction_non_sdk_wake: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -463,6 +596,15 @@ impl BaseWorkflowContext {
     pub(crate) fn take_forced_wft_failure(
         &self,
     ) -> Option<Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .inner
+            .construction_non_sdk_wake
+            .swap(false, Ordering::AcqRel)
+        {
+            self.inner.runtime.set_forced_wft_failure(Box::new(std::io::Error::other(
+                "[TMPRL1100] Nondeterministic future detected while constructing a workflow interceptor",
+            )));
+        }
         self.inner.runtime.take_forced_wft_failure()
     }
 
@@ -808,6 +950,11 @@ impl<W> SyncWorkflowContext<W> {
         self.base.inner.shared.borrow().activation.is_replaying
     }
 
+    /// Returns true if the current work is replaying history events
+    pub fn is_replaying_history_events(&self) -> bool {
+        self.base.inner.shared.borrow().is_replaying_history_events
+    }
+
     /// Returns true if the server suggests this workflow should continue-as-new
     pub fn continue_as_new_suggested(&self) -> bool {
         self.base
@@ -1131,6 +1278,10 @@ impl<W> WorkflowContext<W> {
         self.sync.clone()
     }
 
+    pub(crate) fn base_context(&self) -> BaseWorkflowContext {
+        self.sync.base.clone()
+    }
+
     /// Create a read-only view of this context.
     pub(crate) fn view(&self) -> WorkflowContextView {
         self.sync.view()
@@ -1188,6 +1339,11 @@ impl<W> WorkflowContext<W> {
     /// Returns true if the current workflow task is happening under replay
     pub fn is_replaying(&self) -> bool {
         self.sync.is_replaying()
+    }
+
+    /// Returns true if the current work is replaying history events
+    pub fn is_replaying_history_events(&self) -> bool {
+        self.sync.is_replaying_history_events()
     }
 
     /// Returns true if the server suggests this workflow should continue-as-new
@@ -1441,6 +1597,7 @@ struct WorkflowContextSharedData {
     /// Maps change ids -> resolved status
     changes: HashMap<String, bool>,
     activation: CoreWorkflowActivation,
+    is_replaying_history_events: bool,
     search_attributes: ProtoSearchAttributes,
     random_seed: u64,
     /// Current details string, surfaced via the workflow metadata query.
@@ -2339,7 +2496,8 @@ impl StartedNexusOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::runtime::ConstructionBlockedFuture;
+    use std::{collections::HashMap, task::Context};
     use temporalio_common_wasm::{
         data_converters::{TemporalDeserializable, TemporalSerializable},
         protos::{
@@ -2389,6 +2547,63 @@ mod tests {
             Rc::new(NoopHost),
         );
         WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)))
+    }
+
+    #[test]
+    fn construction_poll_guard_restores_phase_after_panic() {
+        let base = test_context().base_context();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = base.enter_construction_poll();
+            assert!(base.is_construction_poll());
+            panic!("test panic");
+        }));
+
+        assert!(result.is_err());
+        assert!(!base.is_construction_poll());
+    }
+
+    #[test]
+    fn construction_blocked_future_does_not_poll_inner_future() {
+        let base = test_context().base_context();
+        let polls = Rc::new(Cell::new(0));
+        let poll_counter = polls.clone();
+        let mut future = ConstructionBlockedFuture::new(
+            base.clone(),
+            future::poll_fn(move |_| {
+                poll_counter.set(poll_counter.get() + 1);
+                Poll::Ready(42)
+            }),
+        );
+        let waker = base.construction_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        {
+            let _guard = base.enter_construction_poll();
+            assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Pending);
+        }
+        assert_eq!(polls.get(), 0);
+        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Ready(42));
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[test]
+    fn construction_waker_flags_only_non_sdk_wakes() {
+        let base = test_context().base_context();
+        base.construction_waker().wake_by_ref();
+        assert!(
+            base.take_forced_wft_failure()
+                .expect("non-SDK wake should force a workflow task failure")
+                .to_string()
+                .contains("TMPRL1100")
+        );
+
+        let base = test_context().base_context();
+        let waker = base.construction_waker();
+        let _guard = SdkWakeGuard::new();
+        waker.wake_by_ref();
+        drop(_guard);
+        assert!(base.take_forced_wft_failure().is_none());
     }
 
     #[test]

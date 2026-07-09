@@ -77,6 +77,7 @@ pub mod error;
 pub mod interceptors;
 mod workflow_executor;
 mod workflow_future;
+pub mod workflow_interceptors;
 mod workflow_registry;
 #[cfg(feature = "wasm-workflows")]
 mod workflow_wasm;
@@ -107,6 +108,7 @@ use crate::{
     interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
     workflow_executor::{TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
+    workflow_interceptors::WorkflowInboundInterceptor,
     workflow_registry::WorkflowDefinitions,
 };
 use anyhow::{Context, anyhow, bail};
@@ -167,6 +169,9 @@ pub struct WorkerOptions {
 
     #[builder(field)]
     workflows: WorkflowDefinitions,
+
+    #[builder(field)]
+    workflow_inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
 
     #[cfg(feature = "wasm-workflows")]
     #[builder(field)]
@@ -319,6 +324,17 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
         Ok(self)
     }
 
+    /// Append a [WorkflowInboundInterceptor] to the chain. Interceptors run in the order they
+    /// are added, outer-most first.
+    pub fn add_workflow_inbound_interceptor(
+        mut self,
+        interceptor: impl WorkflowInboundInterceptor,
+    ) -> Self {
+        self.workflow_inbound_interceptors
+            .push(Arc::new(interceptor));
+        self
+    }
+
     /// Register a prebuilt WASM workflow component that exports one or more workflows.
     #[cfg(feature = "wasm-workflows")]
     pub fn register_wasm_workflow(mut self, component: WasmWorkflowComponent) -> Self {
@@ -379,6 +395,17 @@ impl WorkerOptions {
         self.workflows
             .register_workflow_run_with_factory::<W, F>(factory)?;
         Ok(self)
+    }
+
+    /// Append a [WorkflowInboundInterceptor] to the chain. Interceptors run in the order they
+    /// are added, outer-most first.
+    pub fn add_workflow_inbound_interceptor(
+        &mut self,
+        interceptor: impl WorkflowInboundInterceptor,
+    ) -> &mut Self {
+        self.workflow_inbound_interceptors
+            .push(Arc::new(interceptor));
+        self
     }
 
     /// Register a prebuilt WASM workflow component that exports one or more workflows.
@@ -446,6 +473,7 @@ struct CommonWorker {
     task_queue: String,
     worker_interceptor: Option<Box<dyn WorkerInterceptor>>,
     activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
+    workflow_inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
     client_options: ClientOptions,
     data_converter: DataConverter,
 }
@@ -537,6 +565,7 @@ impl Worker {
             client_options,
             Default::default(),
             Default::default(),
+            Default::default(),
         )
     }
 
@@ -549,9 +578,17 @@ impl Worker {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let acts = std::mem::take(&mut options.activities);
         let wfs = std::mem::take(&mut options.workflows);
+        let workflow_inbound_interceptors =
+            std::mem::take(&mut options.workflow_inbound_interceptors);
         #[cfg(feature = "wasm-workflows")]
         let wasm_components = std::mem::take(&mut options.wasm_workflow_components);
-        let mut me = Self::new_from_core_definitions(worker, client_options, acts, wfs);
+        let mut me = Self::new_from_core_definitions(
+            worker,
+            client_options,
+            acts,
+            wfs,
+            workflow_inbound_interceptors,
+        );
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
         #[cfg(feature = "wasm-workflows")]
         me.workflow_half
@@ -565,6 +602,7 @@ impl Worker {
         client_options: ClientOptions,
         activities: ActivityDefinitions,
         workflows: WorkflowDefinitions,
+        workflow_inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
     ) -> Self {
         let data_converter = client_options.data_converter.clone();
         Self {
@@ -573,6 +611,7 @@ impl Worker {
                 worker,
                 worker_interceptor: None,
                 activity_inbound_interceptors: Vec::new(),
+                workflow_inbound_interceptors,
                 client_options,
                 data_converter,
             },
@@ -860,6 +899,17 @@ impl Worker {
             .push(Arc::new(interceptor));
     }
 
+    /// Append a [WorkflowInboundInterceptor] to the chain. Interceptors run in the order they
+    /// are added, outer-most first.
+    pub fn add_workflow_inbound_interceptor(
+        &mut self,
+        interceptor: impl WorkflowInboundInterceptor,
+    ) {
+        self.common
+            .workflow_inbound_interceptors
+            .push(Arc::new(interceptor));
+    }
+
     /// Turns this rust worker into a new worker with all the same workflows and activities
     /// registered, but with a new underlying core worker. Can be used to swap the worker for
     /// a replay worker, change task queues, etc.
@@ -924,6 +974,7 @@ impl WorkflowHalf {
                         completions_tx.clone(),
                         common.data_converter.clone(),
                         self.detect_nondeterministic_futures,
+                        common.workflow_inbound_interceptors.clone(),
                     ) {
                         Ok(result) => result,
                         Err(e) => {

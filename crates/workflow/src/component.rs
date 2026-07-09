@@ -7,16 +7,17 @@ use crate::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance as RuntimeWorkflowInstance,
         host::WorkflowHost,
-        instance::instantiate_workflow,
+        instance::instantiate_workflow_with_interceptors,
         types::{
             ActivationJobResult, MainRoutineCompletion, RoutineCompletion, TerminalOutcome,
             UpdateRoutineCompletion, WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowInit,
         },
     },
+    workflow_interceptors::WorkflowInboundInterceptor,
 };
 use futures_util::task::noop_waker;
 use prost::Message;
-use std::{cell::RefCell, marker::PhantomData, rc::Rc};
+use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 use temporalio_common_wasm::{
     data_converters::DataConverter,
     protos::{coresdk::workflow_commands::WorkflowCommand, temporal::api::failure::v1::Failure},
@@ -208,6 +209,17 @@ pub fn instantiate_component_workflow<W: WorkflowImplementation>(
 where
     <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
 {
+    instantiate_component_workflow_with_interceptors::<W>(init, host, Vec::new())
+}
+
+pub fn instantiate_component_workflow_with_interceptors<W: WorkflowImplementation>(
+    init: WorkflowInit,
+    host: Rc<dyn WorkflowHost>,
+    inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+) -> Result<Box<dyn RuntimeWorkflowInstance>, WorkflowFailure>
+where
+    <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
+{
     let args = init.initialize_workflow.arguments.clone();
     let data_converter = DataConverter::default();
     let payload_converter = data_converter.payload_converter().clone();
@@ -219,7 +231,13 @@ where
         data_converter,
         host,
     );
-    instantiate_workflow::<W>(args, payload_converter, base_ctx).map_err(|err| {
+    instantiate_workflow_with_interceptors::<W>(
+        args,
+        payload_converter,
+        base_ctx,
+        inbound_interceptors,
+    )
+    .map_err(|err| {
         Box::new(Failure {
             message: format!("Workflow input deserialization failed: {err}"),
             ..Default::default()

@@ -137,7 +137,7 @@ async fn run_hello_workflow(test_name: &'static str, component: WasmWorkflowComp
         .await
         .expect("WASM workflow result should be available");
     let greeting: String = result.to_value(&payload_converter);
-    assert_eq!(greeting, "Hello, workflow!");
+    assert_eq!(greeting, "Hello, workflow-intercepted! [intercepted]");
 }
 
 async fn wasm_task_failure_attrs(
@@ -174,7 +174,9 @@ async fn build_wasm_hello_component() -> PathBuf {
             "--release",
             "--target",
             "wasm32-unknown-unknown",
+            "--target-dir",
         ])
+        .arg(sample_dir.join("target"))
         .current_dir(&sample_dir)
         .output()
         .await
