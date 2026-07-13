@@ -334,7 +334,7 @@ impl ContinueAsNewAutoUpgradeV1 {
         assert!(ctx.target_worker_deployment_version_changed());
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior = Some(ContinueAsNewVersioningBehavior::AutoUpgrade);
-        ctx.continue_as_new(&(attempt + 1), options)?;
+        ctx.continue_as_new(attempt + 1, options)?;
         Ok("v1.0".to_string())
     }
 
@@ -462,7 +462,7 @@ impl ContinueAsNewUseRampingVersionV1 {
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior =
             Some(ContinueAsNewVersioningBehavior::UseRampingVersion);
-        ctx.continue_as_new(&(attempt + 1), options)?;
+        ctx.continue_as_new(attempt + 1, options)?;
         Ok("v1.0".to_string())
     }
 

@@ -13,7 +13,7 @@ use crate::{
             UpdateRoutineCompletion, WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowInit,
         },
     },
-    workflow_interceptors::WorkflowInboundInterceptor,
+    workflow_interceptors::WorkflowInterceptor,
 };
 use futures_util::task::noop_waker;
 use prost::Message;
@@ -215,7 +215,7 @@ where
 pub fn instantiate_component_workflow_with_interceptors<W: WorkflowImplementation>(
     init: WorkflowInit,
     host: Rc<dyn WorkflowHost>,
-    inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
 ) -> Result<Box<dyn RuntimeWorkflowInstance>, WorkflowFailure>
 where
     <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
@@ -231,18 +231,13 @@ where
         data_converter,
         host,
     );
-    instantiate_workflow_with_interceptors::<W>(
-        args,
-        payload_converter,
-        base_ctx,
-        inbound_interceptors,
-    )
-    .map_err(|err| {
-        Box::new(Failure {
-            message: format!("Workflow input deserialization failed: {err}"),
-            ..Default::default()
+    instantiate_workflow_with_interceptors::<W>(args, payload_converter, base_ctx, interceptors)
+        .map_err(|err| {
+            Box::new(Failure {
+                message: format!("Workflow input deserialization failed: {err}"),
+                ..Default::default()
+            })
         })
-    })
 }
 
 struct ImportedWorkflowHost;
