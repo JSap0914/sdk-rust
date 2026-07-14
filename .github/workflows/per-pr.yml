@@ -157,6 +157,10 @@ jobs:
 
   integ-tests:
     name: Integ tests
+    # TEMP(event-groups): the default cached-download dev server does not yet support Event Groups,
+    # so pin the CLI to a build that does. Remove once Event Groups support lands in a default release.
+    env:
+      CLI_VERSION_OVERRIDE: v1.7.4-standalone-nexus-operations
     timeout-minutes: ${{ github.ref == 'refs/heads/main' && 30 || 25 }}
     strategy:
       fail-fast: false
