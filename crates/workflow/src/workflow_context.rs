@@ -96,6 +96,17 @@ pub struct PatchActivationInput {
     pub patch_id: String,
 }
 
+impl PatchActivationInput {
+    /// Create callback input from a workflow information snapshot and patch ID.
+    #[doc(hidden)]
+    pub fn new(workflow_info: WorkflowContextView, patch_id: String) -> Self {
+        Self {
+            workflow_info,
+            patch_id,
+        }
+    }
+}
+
 /// Callback that decides whether a newly encountered patch should be activated.
 pub type PatchActivationCallback =
     Arc<dyn Fn(PatchActivationInput) -> bool + Send + Sync + 'static>;
@@ -362,7 +373,8 @@ pub struct RootWorkflowInfo {
 
 impl WorkflowContextView {
     /// Create a new view from workflow initialization data.
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         namespace: String,
         task_queue: String,
         run_id: String,
@@ -997,10 +1009,10 @@ impl<W> SyncWorkflowContext<W> {
         let res = if deprecated || replaying || notified {
             !replaying || notified
         } else if let Some(callback) = &self.base.inner.patch_activation_callback {
-            callback(PatchActivationInput {
-                workflow_info: self.base.view(),
-                patch_id: patch_id.to_string(),
-            })
+            callback(PatchActivationInput::new(
+                self.base.view(),
+                patch_id.to_string(),
+            ))
         } else {
             true
         };
